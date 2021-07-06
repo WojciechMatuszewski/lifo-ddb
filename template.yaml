@@ -1,0 +1,221 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: lifo-ddb
+
+Globals:
+  Function:
+    Timeout: 5
+    CodeUri:
+    Handler: main
+    Runtime: go1.x
+    Tracing: Active
+
+Resources:
+  # Resource constrained API #
+  ConstrainedAPI:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowCredentials: false
+        AllowMethods:
+          - "*"
+        AllowOrigins:
+          - "*"
+  ConstrainedFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/functions/constrained
+      ReservedConcurrentExecutions: 1
+      Events:
+        MakeARequestGET:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ConstrainedAPI
+            Path: /
+            Method: POST
+
+  # Application #
+  TaskTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: KEYS_ONLY
+      GlobalSecondaryIndexes:
+        - IndexName: "byStatus"
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  ProcessTasksTopic:
+    Type: AWS::SNS::Topic
+    Properties: {}
+
+  TaskAPI:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowCredentials: false
+        AllowMethods:
+          - "*"
+        AllowOrigins:
+          - "*"
+
+  CreateTaskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/functions/create-task
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TaskTable
+      Events:
+        MakeARequest:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TaskAPI
+            Path: /
+            Method: POST
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource: !Sub ${TaskTable.Arn}
+
+  StreamReaderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/functions/stream-reader
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref ProcessTasksTopic
+      Environment:
+        Variables:
+          PROCESS_TASKS_TOPIC: !Ref ProcessTasksTopic
+      Events:
+        DynamoDBStreamEvent:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt TaskTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 10
+            MaximumRecordAgeInSeconds: 120
+            MaximumRetryAttempts: 0
+
+  EBConnection:
+    Type: AWS::Events::Connection
+    Properties:
+      Name: TaskSystemConnection
+      AuthorizationType: API_KEY
+      AuthParameters:
+        ApiKeyAuthParameters:
+          ApiKeyName: MockAPIKey
+          ApiKeyValue: Test
+
+  EBDestination:
+    Type: AWS::Events::ApiDestination
+    Properties:
+      ConnectionArn: !Sub ${EBConnection.Arn}
+      HttpMethod: POST
+      InvocationEndpoint: !Sub "https://${ConstrainedAPI}.execute-api.${AWS::Region}.amazonaws.com/"
+
+  EBRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: AllowInvokeDestination
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:InvokeApiDestination
+                Resource: !Sub ${EBDestination.Arn}
+
+  EBRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: TaskSystemRule
+      EventPattern:
+        source:
+          - TaskProcessor
+      State: ENABLED
+      Targets:
+        - Arn: !Sub ${EBDestination.Arn}
+          Id: TaskSystemDestination
+          RoleArn: !Sub ${EBRuleRole.Arn}
+          InputTransformer:
+            InputPathsMap:
+              detail: $.detail
+              # There are some funky problems with the formatting here.
+              # It seems to me that just writing <detail> makes it so that the target is never invoked (TODO: Check the CloudTrail)
+            InputTemplate: >
+              "<detail>"
+
+  TasksProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/functions/task-processor
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TaskTable
+          RUNNER_ENDPOINT: !Sub "https://${ConstrainedAPI}.execute-api.${AWS::Region}.amazonaws.com/"
+      Events:
+        ProcessTasks:
+          Type: SNS
+          Properties:
+            Topic: !Ref ProcessTasksTopic
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !Sub "${TaskTable.Arn}/index/byStatus"
+            - Effect: Allow
+              Action:
+                - dynamodb:UpdateItem
+              Resource: !Sub ${TaskTable.Arn}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - events:PutEvents
+              Resource: "*"
+
+Outputs:
+  ConstrainedAPIEndpoint:
+    Value: !Sub "https://${ConstrainedAPI}.execute-api.${AWS::Region}.amazonaws.com/"
+  CreateTaskAPIEndpoint:
+    Value: !Sub "https://${TaskAPI}.execute-api.${AWS::Region}.amazonaws.com/"
+  CreateTaskFunctionLogs:
+    Value: !Sub "sam logs --name ${CreateTaskFunction} --tail"
+  StreamReaderFunctionLogs:
+    Value: !Sub "sam logs --name ${StreamReaderFunction} --tail"
+  TasksProcessorFunctionLogs:
+    Value: !Sub "sam logs --name ${TasksProcessorFunction} --tail"
