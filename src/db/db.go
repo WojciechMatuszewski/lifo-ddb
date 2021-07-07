@@ -4,6 +4,7 @@ import (
 	"context"
 	"lifo-ddb/src/task"
 	"log"
+	"math/rand"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -100,6 +101,11 @@ func (db *DB) TransitionTask(ctx context.Context, tsk task.Task, from task.Statu
 
 	db.logger.Printf("Trying to update the task with a key %#v", avs)
 
+	if randomNumber() < 5 {
+		db.logger.Printf("Failing due to random number")
+		return task.Task{}, errors.New("random number fail")
+	}
+
 	out, err := db.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		Key: map[string]types.AttributeValue{
 			"id": avs["id"],
@@ -136,4 +142,8 @@ func (db *DB) TransitionTask(ctx context.Context, tsk task.Task, from task.Statu
 	db.logger.Printf("Task after transitioning %#v", tskItem.ToTask())
 
 	return tskItem.ToTask(), nil
+}
+
+func randomNumber() int {
+	return rand.Intn(10-1) + 1
 }

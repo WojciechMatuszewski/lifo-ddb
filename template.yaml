@@ -192,6 +192,13 @@ Resources:
           Type: SNS
           Properties:
             Topic: !Ref ProcessTasksTopic
+      EventInvokeConfig:
+        MaximumEventAgeInSeconds: 60
+        MaximumRetryAttempts: 0
+        DestinationConfig:
+          OnFailure:
+            Type: Lambda
+            Destination: !Sub ${TaskProcessorFailureDestinationFunction.Arn}
       Policies:
         - Statement:
             - Effect: Allow
@@ -208,6 +215,11 @@ Resources:
                 - events:PutEvents
               Resource: "*"
 
+  TaskProcessorFailureDestinationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/functions/failure-destination
+
 Outputs:
   ConstrainedAPIEndpoint:
     Value: !Sub "https://${ConstrainedAPI}.execute-api.${AWS::Region}.amazonaws.com/"
@@ -219,3 +231,5 @@ Outputs:
     Value: !Sub "sam logs --name ${StreamReaderFunction} --tail"
   TasksProcessorFunctionLogs:
     Value: !Sub "sam logs --name ${TasksProcessorFunction} --tail"
+  TaskProcessorFailureDestinationLogs:
+    Value: !Sub "sam logs --name ${TaskProcessorFailureDestinationFunction} --tail"
